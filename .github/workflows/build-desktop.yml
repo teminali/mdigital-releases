@@ -1,0 +1,188 @@
+name: Build and publish Desktop
+
+# Runs HERE, in the public releases repo, because Actions minutes and artifact storage
+# are free for public repositories while the private source repo hit its quota. The
+# source stays private: it is checked out with a read-only deploy key.
+#
+# Start it by hand (Actions tab, "Run workflow", enter the source tag, for example
+# v0.0.3). Nothing starts it automatically, so only people with write access can run it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag in the private source repo to build and publish (for example v0.0.3)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-desktop-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag must look like vX.Y.Z
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$TAG' is not a release tag like v0.0.3"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.platform.name }})
+    needs: prepare
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: macOS
+            os: macos-latest
+            target-cmd: npx electron-builder --mac --publish never
+          - name: Windows
+            os: windows-latest
+            target-cmd: npx electron-builder --win --publish never
+          - name: Linux
+            os: ubuntu-22.04
+            target-cmd: npx electron-builder --linux --publish never
+
+    steps:
+      - name: Check out the source (private repo, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: teminali/m-digital-desktop
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install Linux dependencies (Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 libarchive-tools fakeroot dpkg
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Run Desktop Automated Tests
+        run: npm run test:desktop
+
+      - name: Build Standalone Server & Desktop Package
+        shell: bash
+        # The Next build downloads Google Fonts. When a download fails it shows up as a
+        # misleading "Can't resolve @vercel/turbopack-next/internal/font/google/font"
+        # error: the macOS runner failed this way while Linux built the same code in
+        # the same minute. Try up to three times before giving up.
+        run: |
+          for attempt in 1 2 3; do
+            if npm run build:desktop; then exit 0; fi
+            echo "::warning::build attempt $attempt of 3 failed"
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 30
+          done
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          NEXT_TELEMETRY_DISABLED: "1"
+          # Public values (the web app ships the same two). The desktop build writes
+          # them into desktop/cloud-config.json so the optional cloud sync can reach
+          # the cloud. Set both as Variables on THIS repository.
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          # A release must not go out without them: fail the build instead of
+          # shipping an app that quietly has no cloud option.
+          MD_REQUIRE_CLOUD_CONFIG: "1"
+
+      - name: Package Binaries with Electron Builder
+        shell: bash
+        run: |
+          # macOS runners have low file descriptor limits; electron-builder
+          # opens thousands of files when packaging node_modules.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            sudo launchctl limit maxfiles 65536 65536
+            ulimit -n 65536
+          fi
+          ${{ matrix.platform.target-cmd }}
+
+      - name: Upload Platform Artifacts
+        # No continue-on-error: if the installers cannot be handed to the publish
+        # job, the run must fail loudly instead of publishing nothing.
+        uses: actions/upload-artifact@v4
+        with:
+          name: m-digital-desktop-${{ matrix.platform.name }}
+          retention-days: 1
+          path: |
+            dist-desktop/*.dmg
+            dist-desktop/*.zip
+            dist-desktop/*.exe
+            dist-desktop/*.AppImage
+            dist-desktop/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-binaries
+          pattern: m-digital-desktop-*
+          merge-multiple: true
+
+      - name: Display release artifacts
+        run: |
+          ls -la release-binaries/
+
+      - name: Generate SHA-256 Checksums
+        run: |
+          cd release-binaries
+          # The desktop updater reads this file and refuses an update without it.
+          sha256sum *.dmg *.zip *.exe *.AppImage *.deb > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        # The release is created in THIS repository (the public mirror the apps read
+        # their updates from). The tag is prefixed (desktop-v0.0.3) so another
+        # product's v0.0.3 on this mirror never collides with it.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-${{ inputs.tag }}
+          files: |
+            release-binaries/*.dmg
+            release-binaries/*.zip
+            release-binaries/*.exe
+            release-binaries/*.AppImage
+            release-binaries/*.deb
+            release-binaries/SHA256SUMS.txt
+          body: |
+            M-Digital Desktop ${{ inputs.tag }}
+
+            The app checks this page for new versions by itself. You can also use Check for Updates (Help menu, or the app menu on macOS) or Settings, Integrations, App updates.
+
+            ## Installation
+            - **macOS**: Download the .dmg for your Mac (arm64 for Apple Silicon, x64 for Intel), open it and drag the app to Applications
+            - **Linux**: Download the .AppImage, make it executable (`chmod +x`), and run it. Or install the .deb package (a .deb install cannot update itself)
+            - **Windows**: Download the .exe installer and run
+
+            The apps are not signed yet, so macOS and Windows show a warning the first time. The downloads page on https://mhasibudigital.com/downloads explains the steps and offers a terminal install.
+
+            ## Verification
+            SHA256 checksums are provided in SHA256SUMS.txt
+          generate_release_notes: false
+          draft: false
+          prerelease: false
