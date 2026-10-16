@@ -184,5 +184,7 @@ jobs:
             ## Verification
             SHA256 checksums are provided in SHA256SUMS.txt
           generate_release_notes: false
-          draft: false
+          # Created as a DRAFT on purpose: nobody can see it and no app is offered it until
+          # someone has started the real installers and made it public by hand.
+          draft: true
           prerelease: false
