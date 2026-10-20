@@ -176,7 +176,14 @@ async function main() {
     if (startup && startup.supported) {
       try {
         const on = await win.evaluate(() => window.mdDesktop.launchAtLogin.set(true));
-        check('the switch turns on and the system says it is on', on.enabled === true, JSON.stringify(on));
+        let detail = JSON.stringify(on);
+        if (on.enabled !== true && process.platform === 'win32') {
+          // The one thing that has failed on a real Windows machine: say what Windows itself holds.
+          const raw = await app.evaluate(({ app: electronApp }) => electronApp.getLoginItemSettings()).catch((error) => ({ error: String(error) }));
+          const reg = (key) => { const r = spawnSync('reg', ['query', key], { encoding: 'utf8' }); return (r.stdout || r.stderr || '').replace(/\r?\n/g, ' | ').slice(0, 600); };
+          detail += ` raw=${JSON.stringify(raw)} Run=[${reg('HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')}] StartupApproved=[${reg('HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run')}]`;
+        }
+        check('the switch turns on and the system says it is on', on.enabled === true, detail);
       } finally {
         const off = await win.evaluate(() => window.mdDesktop.launchAtLogin.set(false));
         check('the switch turns off again and the system says it is off', off.enabled === false, JSON.stringify(off));
@@ -216,6 +223,53 @@ async function main() {
     const forged = licenceModule.makeCode({ privateKey: stranger, keyIndex: 0, email: 'smoke@example.com', issuedAt: Date.now(), endsAt: Date.now() + 365 * DAY });
     const forgedAnswer = await win.evaluate((code) => window.mdDesktop.licence.activate(code), forged);
     check('a code that looks right but was signed with another key is refused', forgedAnswer.ok === false && forgedAnswer.code === 'LICENCE_SIGNATURE', JSON.stringify(forgedAnswer));
+    // Backups (0.0.9). A copy is made by a worker thread running VACUUM INTO and a restore swaps the live file, and
+    // only the installed app proves both. A business is saved, copied, another is saved, and the copy is restored:
+    // the second business must be gone, what was live before must be kept in a safety copy, and the app must ask to
+    // restart (the restart itself is stood in for, so this run can look at the result).
+    const backupModule = require(path.join(path.resolve(source), 'desktop', 'backup.js'));
+    const made = await win.evaluate(async () => {
+      const b = window.mdDesktop.backup;
+      if (!b) return { present: false };
+      const user = await window.mdDesktop.local.auth({ op: 'signIn', email: 'smoke@example.com', password: 'smoke-password-2' });
+      const save = (id) => window.mdDesktop.local.commit({ ops: [{ table: 'businesses', id, type: 'set', fields: { uid: user.uid, businessId: id, businessName: id } }] });
+      await save('before-copy');
+      const run = await b.run();
+      await save('after-copy');
+      const status = await b.status();
+      return { present: true, run, copies: status.copies.map((c) => c.id) };
+    });
+    check('the backup bridge is present in the installed app', made.present === true);
+    check('Back up now makes a copy in the installed app', Boolean(made.run && made.run.ok) && made.copies.length === 1, JSON.stringify(made.run));
+    const autoRoot = path.join(dataDir, 'backups', 'auto');
+    const copyFolders = fs.existsSync(autoRoot) ? fs.readdirSync(autoRoot).filter((n) => n.startsWith('md-')) : [];
+    const copyCheck = copyFolders.length === 1 ? backupModule.checkDatabase(path.join(autoRoot, copyFolders[0], 'accounting.sqlite')) : { ok: false };
+    check('the copy is on disk, opens, passes its check and holds the account', copyCheck.ok === true && copyCheck.owner === true, JSON.stringify(copyCheck));
+    await app.evaluate(({ app: electronApp }) => {
+      globalThis.__md = { restarts: 0, quit: electronApp.quit, relaunch: electronApp.relaunch };
+      electronApp.relaunch = () => { globalThis.__md.restarts += 1; };
+      electronApp.quit = () => {};
+    });
+    const restored = await win.evaluate(async (id) => window.mdDesktop.backup.restore(id), made.copies[0]);
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const restarts = await app.evaluate(({ app: electronApp }) => {
+      const state = globalThis.__md;
+      electronApp.quit = state.quit;
+      electronApp.relaunch = state.relaunch;
+      return state.restarts;
+    });
+    check('a restore in the installed app succeeds and asks the app to restart', restored.ok === true && restarts === 1, JSON.stringify(restored) + ` restarts: ${restarts}`);
+    const afterRestore = await win.evaluate(async () => {
+      await window.mdDesktop.local.auth({ op: 'signIn', email: 'smoke@example.com', password: 'smoke-password-2' });
+      return (await window.mdDesktop.local.query({ table: 'businesses' })).map((row) => row.id).sort();
+    });
+    check('after the restore the books are as they were at the copy', JSON.stringify(afterRestore) === JSON.stringify(['before-copy']), JSON.stringify(afterRestore));
+    const safetyRoot = path.join(dataDir, 'backups', 'safety');
+    const safetyFolders = fs.existsSync(safetyRoot) ? fs.readdirSync(safetyRoot) : [];
+    const safetyCheck = safetyFolders.length === 1 ? backupModule.checkDatabase(path.join(safetyRoot, safetyFolders[0], 'accounting.sqlite')) : { ok: false };
+    check('what was live before the restore is kept in a safety copy that opens', safetyCheck.ok === true, JSON.stringify(safetyCheck));
+    const refused = await win.evaluate(async () => window.mdDesktop.backup.restore('auto:../../etc'));
+    check('a restore cannot be pointed at any path the page makes up', refused.ok === false && refused.error === 'not-found', JSON.stringify(refused));
     if (pageErrors.length) console.log(`note: ${pageErrors.length} uncaught page error(s), first: ${pageErrors[0]}`);
     firstRunOk = true;
   } catch (error) {
