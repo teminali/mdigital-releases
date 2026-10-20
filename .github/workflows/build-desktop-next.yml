@@ -1,0 +1,366 @@
+# NOT LIVE. This is the next version of the release workflow (tag and version check,
+# smoke test of every installer, draft first, live feed check, rehearsal mode). It has not
+# been run in CI yet. The workflow that is live in the public repo is build-desktop.yml
+# next to this file. When this one has passed a rehearsal, it replaces that one.
+
+name: Build and publish Desktop (next, with smoke tests)
+
+# Runs HERE, in the public releases repo, because Actions minutes and artifact storage
+# are free for public repositories while the private source repo hit its quota. The
+# source stays private: it is checked out with a read-only deploy key.
+#
+# Start it by hand (Actions tab, "Run workflow", enter the source tag, for example
+# v0.0.4). Nothing starts it automatically, so only people with write access can run it.
+#
+# What stands between a tag and the public release page:
+#   1. The tag must be vX.Y.Z and match package.json at that tag.
+#   2. Tests, build and package on macOS, Windows and Linux.
+#   3. Each installer is started like a user would and must open the sign-in page.
+#   4. The release is first created as a DRAFT (the updater and the public cannot see
+#      drafts), downloaded again and checked against SHA256SUMS.txt.
+#   5. Only then it is made public, and the live update feed is asked the way an
+#      installed app asks. If that check fails the release goes back to draft.
+#
+# mode "rehearsal" runs 1 to 4 against a private draft named rehearsal-<tag> and then
+# deletes it. It never makes a public release, so it is safe to practice with.
+#
+# The scripts this file uses live in scripts/ of this repo. The reviewed copy of all of
+# them is scripts/release-mirror/ in the private source repo; keep the two the same
+# (bash scripts/release-mirror/check-copy.sh compares them).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag in the private source repo to build (for example v0.0.4)'
+        required: true
+      mode:
+        description: 'release = publish for real. rehearsal = check everything, make only a private draft, then delete it.'
+        type: choice
+        required: true
+        default: release
+        options:
+          - release
+          - rehearsal
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-desktop-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the release scripts (this repository)
+        uses: actions/checkout@v4
+        with:
+          path: mirror
+
+      - name: Check out package.json at the tag (private source, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: teminali/m-digital-desktop
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+          path: source
+          sparse-checkout: package.json
+          sparse-checkout-cone-mode: false
+
+      - name: The tag must be vX.Y.Z and match the version in package.json
+        id: version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          version="$(node mirror/scripts/check-tag-version.js "$TAG" source/package.json)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version from $TAG"
+
+      - name: A published release is never overwritten
+        if: inputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          state="$(gh release view "desktop-$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || echo none)"
+          if [ "$state" = "false" ]; then
+            echo "::error::desktop-$TAG is already published. Bump the version and tag again."
+            exit 1
+          fi
+          echo "No published release named desktop-$TAG. Good."
+
+  build:
+    name: Build (${{ matrix.platform.name }})
+    needs: prepare
+    runs-on: ${{ matrix.platform.os }}
+    defaults:
+      run:
+        working-directory: source
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # macos-latest is Apple Silicon, so the arm64 installer is the one started.
+          - name: macOS
+            os: macos-latest
+            target-cmd: npx electron-builder --mac --publish never
+            smoke-kind: mac-dmg
+            smoke-installer: '*-mac-arm64.dmg'
+          - name: Windows
+            os: windows-latest
+            target-cmd: npx electron-builder --win --publish never
+            smoke-kind: win-exe
+            smoke-installer: '*-win-x64.exe'
+          - name: Linux
+            os: ubuntu-22.04
+            target-cmd: npx electron-builder --linux --publish never
+            smoke-kind: linux-appimage
+            smoke-installer: '*-linux-x86_64.AppImage'
+
+    steps:
+      - name: Check out the release scripts (this repository)
+        uses: actions/checkout@v4
+        with:
+          path: mirror
+
+      - name: Check out the source (private repo, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: teminali/m-digital-desktop
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+          path: source
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install Linux dependencies (Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 libarchive-tools fakeroot dpkg xvfb
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Run Desktop Automated Tests
+        run: npm run test:desktop
+
+      - name: Build Standalone Server & Desktop Package
+        shell: bash
+        # The Next build downloads Google Fonts. When a download fails it shows up as a
+        # misleading "Can't resolve @vercel/turbopack-next/internal/font/google/font"
+        # error: the macOS runner failed this way while Linux built the same code in
+        # the same minute. Try up to three times before giving up.
+        run: |
+          for attempt in 1 2 3; do
+            if npm run build:desktop; then exit 0; fi
+            echo "::warning::build attempt $attempt of 3 failed"
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 30
+          done
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          NEXT_TELEMETRY_DISABLED: "1"
+          # Public values (the web app ships the same two). The desktop build writes
+          # them into desktop/cloud-config.json so the optional cloud sync can reach
+          # the cloud. Set both as Variables on THIS repository.
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          # A release must not go out without them: fail the build instead of
+          # shipping an app that quietly has no cloud option.
+          MD_REQUIRE_CLOUD_CONFIG: "1"
+
+      - name: Package Binaries with Electron Builder
+        shell: bash
+        run: |
+          # macOS runners have low file descriptor limits; electron-builder
+          # opens thousands of files when packaging node_modules.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            sudo launchctl limit maxfiles 65536 65536
+            ulimit -n 65536
+          fi
+          ${{ matrix.platform.target-cmd }}
+
+      - name: Start the installer and check the app runs
+        shell: bash
+        env:
+          SMOKE_KIND: ${{ matrix.platform.smoke-kind }}
+          SMOKE_INSTALLER: ${{ matrix.platform.smoke-installer }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SCRIPT: ${{ github.workspace }}/mirror/scripts/smoke.js
+          SOURCE_DIR: ${{ github.workspace }}/source
+        run: |
+          matches=( dist-desktop/$SMOKE_INSTALLER )
+          if [ "${#matches[@]}" != 1 ] || [ ! -f "${matches[0]}" ]; then
+            echo "::error::expected exactly one installer matching $SMOKE_INSTALLER"
+            ls -la dist-desktop
+            exit 1
+          fi
+          prefix=""
+          if [ "$RUNNER_OS" = "Linux" ]; then prefix="xvfb-run -a"; fi
+          $prefix node "$SCRIPT" --kind "$SMOKE_KIND" --file "${matches[0]}" --version "$VERSION" --source "$SOURCE_DIR" --work "$RUNNER_TEMP/smoke"
+
+      - name: Keep the smoke screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m-digital-smoke-${{ matrix.platform.name }}
+          retention-days: 1
+          path: ${{ runner.temp }}/smoke/smoke.png
+          if-no-files-found: ignore
+
+      - name: Upload Platform Artifacts
+        # No continue-on-error: if the installers cannot be handed to the publish
+        # job, the run must fail loudly instead of publishing nothing.
+        uses: actions/upload-artifact@v4
+        with:
+          name: m-digital-desktop-${{ matrix.platform.name }}
+          retention-days: 1
+          path: |
+            source/dist-desktop/*.dmg
+            source/dist-desktop/*.zip
+            source/dist-desktop/*.exe
+            source/dist-desktop/*.AppImage
+            source/dist-desktop/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: Make the release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      # A real release is desktop-vX.Y.Z. The prefix keeps it apart from other products
+      # on this repo, and it is what the updater reads. A rehearsal can never collide
+      # with it and the updater ignores it.
+      REL: ${{ inputs.mode == 'rehearsal' && format('rehearsal-{0}', inputs.tag) || format('desktop-{0}', inputs.tag) }}
+    steps:
+      - name: Check out the release scripts (this repository)
+        uses: actions/checkout@v4
+        with:
+          path: mirror
+
+      - name: Check out the update code (private source, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: teminali/m-digital-desktop
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+          path: source
+          sparse-checkout: desktop/updater.js
+          sparse-checkout-cone-mode: false
+
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-binaries
+          pattern: m-digital-desktop-*
+          merge-multiple: true
+
+      - name: Check the file set and write the checksums
+        run: |
+          expected=(
+            "M-Digital-Accounting-$VERSION-mac-arm64.dmg"
+            "M-Digital-Accounting-$VERSION-mac-arm64.zip"
+            "M-Digital-Accounting-$VERSION-mac-x64.dmg"
+            "M-Digital-Accounting-$VERSION-mac-x64.zip"
+            "M-Digital-Accounting-$VERSION-win-x64.exe"
+            "M-Digital-Accounting-$VERSION-linux-x86_64.AppImage"
+            "M-Digital-Accounting-$VERSION-linux-amd64.deb"
+          )
+          ls -la release-binaries
+          for name in "${expected[@]}"; do
+            if [ ! -s "release-binaries/$name" ]; then
+              echo "::error::missing or empty: $name"
+              exit 1
+            fi
+          done
+          if [ "$(ls release-binaries | wc -l)" != "${#expected[@]}" ]; then
+            echo "::error::release-binaries has files that are not in the expected list"
+            exit 1
+          fi
+          # The desktop updater reads this file and refuses an update without it.
+          (cd release-binaries && sha256sum "${expected[@]}" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Write the release notes
+        run: |
+          cat > notes.md <<EOF
+          M-Digital Desktop $TAG
+
+          The app checks this page for new versions by itself. You can also use Check for Updates (Help menu, or the app menu on macOS) or Settings, Integrations, App updates.
+
+          ## Installation
+          - **macOS**: Download the .dmg for your Mac (arm64 for Apple Silicon, x64 for Intel), open it and drag the app to Applications
+          - **Linux**: Download the .AppImage, make it executable (\`chmod +x\`), and run it. Or install the .deb package (a .deb install cannot update itself)
+          - **Windows**: Download the .exe installer and run
+
+          ## First open
+          The apps are not signed yet, so macOS and Windows show a warning the first time.
+          - **macOS**: if it says the app cannot be checked, open System Settings, Privacy and Security, and choose Open Anyway. Or run this once in Terminal: \`xattr -dr com.apple.quarantine "/Applications/M-Digital Accounting.app"\`
+          - **Windows**: on the blue SmartScreen window choose More info, then Run anyway
+
+          ## Verification
+          SHA256 checksums are provided in SHA256SUMS.txt
+          EOF
+          # The heredoc is indented to sit inside this script; strip that indent.
+          sed -i 's/^          //' notes.md
+
+      - name: Make the release as a DRAFT (nobody can see or update from a draft)
+        run: |
+          state="$(gh release view "$REL" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || echo none)"
+          if [ "$state" = "false" ]; then
+            echo "::error::$REL is already published. Releases are never overwritten."
+            exit 1
+          fi
+          if [ "$state" = "true" ]; then
+            echo "Removing a leftover draft of $REL from an earlier failed run"
+            gh release delete "$REL" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$REL" -R "$GITHUB_REPOSITORY" --draft --target main \
+            --title "$REL" --notes-file notes.md \
+            release-binaries/*
+
+      - name: Download the draft again and check every file against the checksums
+        run: |
+          mkdir verify
+          gh release download "$REL" -R "$GITHUB_REPOSITORY" --dir verify
+          (cd verify && sha256sum -c SHA256SUMS.txt)
+          # The same files, nothing more and nothing less.
+          diff <(ls release-binaries | sort) <(ls verify | grep -v '^SHA256SUMS.txt$' | sort)
+          test -s verify/SHA256SUMS.txt
+          echo "The draft holds exactly what was built, and every checksum matches."
+
+      - name: Make it public
+        id: go_public
+        if: inputs.mode == 'release'
+        run: gh release edit "$REL" -R "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Ask the live update feed, as an installed app would
+        if: inputs.mode == 'release'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node mirror/scripts/check-feed.js --repo "$GITHUB_REPOSITORY" --tag "$REL" --source source
+
+      - name: The feed check failed, so pull the release back to draft
+        if: failure() && steps.go_public.outcome == 'success'
+        run: |
+          gh release edit "$REL" -R "$GITHUB_REPOSITORY" --draft=true
+          echo "::error::$REL was made public but the feed check failed. It is a draft again, so no app can be offered it."
+
+      - name: Delete the rehearsal draft
+        if: always() && inputs.mode == 'rehearsal'
+        run: gh release delete "$REL" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
