@@ -318,6 +318,33 @@ async function main() {
     check('the Cashier saves a sale with its journal and ledger lines, and is refused a purchase and a lone ledger line', staffRun.sale === 'ok' && staffRun.purchase === 'denied' && staffRun.loneLedger === 'denied', JSON.stringify(staffRun));
     check('the Cashier sees only their own sale, while the invoice number lookup still sees everyone\'s', JSON.stringify(staffRun.seen) === JSON.stringify(['s-1']) && staffRun.numbers.includes('INV-0001') && staffRun.numbers.includes('INV-0002'), JSON.stringify(staffRun));
     check('backups and licence codes refuse a staff sign-in', staffRun.backup === 'owner-only' && staffRun.licence === 'owner-only', JSON.stringify(staffRun));
+    // More than one computer, in the installed app: sharing starts, a one-time code is made, and the app answers a probe on its
+    // own address with the same pinned certificate check another computer would make. That check is where Electron's runtime
+    // differs from plain Node (it refuses a self-signed certificate as its own trust anchor), so only the packaged app proves it.
+    const lanRun = await win.evaluate(async () => {
+      const m = window.mdDesktop;
+      const out = { present: Boolean(m.lan && m.lan.startSharing) };
+      if (!out.present) return out;
+      try {
+        out.before = (await m.lan.status()).sharing.listening;
+        const on = await m.lan.startSharing();
+        out.on = { listening: on.sharing.listening, port: on.sharing.port, checkNumber: on.sharing.checkNumber };
+        const made = await m.lan.newCode();
+        out.code = typeof made === 'string' ? made : (made && (made.code || made.value)) || null;
+        out.probe = await m.lan.probe({ host: '127.0.0.1', port: on.sharing.port });
+        const off = await m.lan.stopSharing();
+        out.after = off.sharing.listening;
+        out.afterProbe = await m.lan.probe({ host: '127.0.0.1', port: on.sharing.port }).then(() => 'answered', (e) => String((e && e.message) || e).slice(0, 80));
+      } catch (e) {
+        out.error = String((e && e.message) || e).slice(0, 160);
+      }
+      return out;
+    });
+    check('the multi-computer bridge is present in the installed app', lanRun.present === true, JSON.stringify(lanRun));
+    check('sharing starts in the installed app and reports a port and a check number', lanRun.before === false && lanRun.on && lanRun.on.listening === true && Number(lanRun.on.port) > 0 && /^\d{8}$/.test(String(lanRun.on.checkNumber || '').replace(/\s/g, '')), JSON.stringify(lanRun));
+    check('a one-time code is made for adding a computer', typeof lanRun.code === 'string' && lanRun.code.replace(/[^A-Z0-9]/gi, '').length >= 8, JSON.stringify(lanRun));
+    check('the installed app answers a probe with the certificate pinned (the check Electron needs a fingerprint check for)', Boolean(lanRun.probe) && Boolean(lanRun.probe.fingerprint) && /^\d{8}$/.test(String(lanRun.probe.checkNumber || '').replace(/\s/g, '')) && lanRun.on && String(lanRun.probe.checkNumber).replace(/\s/g, '') === String(lanRun.on.checkNumber).replace(/\s/g, ''), JSON.stringify(lanRun));
+    check('sharing stops, and the app stops answering', lanRun.after === false && lanRun.afterProbe !== 'answered', JSON.stringify(lanRun));
     if (pageErrors.length) console.log(`note: ${pageErrors.length} uncaught page error(s), first: ${pageErrors[0]}`);
     firstRunOk = true;
   } catch (error) {
