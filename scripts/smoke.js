@@ -270,6 +270,54 @@ async function main() {
     check('what was live before the restore is kept in a safety copy that opens', safetyCheck.ok === true, JSON.stringify(safetyCheck));
     const refused = await win.evaluate(async () => window.mdDesktop.backup.restore('auto:../../etc'));
     check('a restore cannot be pointed at any path the page makes up', refused.ok === false && refused.error === 'not-found', JSON.stringify(refused));
+    // Staff on this computer (0.0.10). The owner makes a sign-in for a staff record that holds the Cashier role; the
+    // installed app must sign that person in with the role record's name, let them save a sale (the sale's journal and
+    // ledger lines come with it) and see only their own sales while the next invoice number still counts everyone's,
+    // and refuse everything the role does not hold and everything that is only the owner's.
+    const staffRun = await win.evaluate(async () => {
+      const m = window.mdDesktop;
+      const owner = await m.local.auth({ op: 'signIn', email: 'smoke@example.com', password: 'smoke-password-2' });
+      const BIZ = 'before-copy';
+      const set = (table, id, fields, extra = {}) => ({ table, id, type: 'set', fields, ...extra });
+      await m.local.commit({ ops: [
+        set('roles', 'role-cash', { id: 'role-cash', businessId: BIZ, name: 'Cashier', permissions: ['dashboard:view', 'transactions:sales:view', 'transactions:sales:create', 'inventory:products:view'], level: 'staff', isDeleted: false }),
+        set('staffs', 'st-1', { id: 'st-1', businessId: BIZ, name: 'Smoke Cashier', roleId: 'role-cash', roleName: 'Cashier', status: 'Invited', isDeleted: false }),
+        set('payrolls', 'pay-1', { id: 'pay-1', businessId: BIZ, total: 1 }),
+        set('products', 'p-1', { id: 'p-1', businessId: BIZ, productName: 'Tea', sellPrice: 5, quantity: 3 }),
+        set('accounts', 'acc-1', { id: 'acc-1', businessId: BIZ, accountName: 'Cash', balance: 0 }),
+        set('transactions', 'owner-tx', { id: 'owner-tx', uid: owner.uid, businessId: BIZ, txType: 'Sale', invoiceId: 'INV-0001', totalAmount: 1, isDeleted: false }),
+      ] });
+      const out = {};
+      out.made = (await m.local.auth({ op: 'createStaff', staffId: 'st-1', email: 'till@example.com', password: 'till-password-1' })).roleName;
+      await m.local.auth({ op: 'signOut' });
+      out.role = (await m.local.auth({ op: 'signIn', email: 'till@example.com', password: 'till-password-1' })).role;
+      out.payrolls = (await m.local.query({ table: 'payrolls' })).length;
+      out.products = (await m.local.query({ table: 'products' })).length;
+      const tryCommit = async (ops) => {
+        try { await m.local.commit({ ops }); return 'ok'; } catch (e) { return /PERMISSION_DENIED/.test(String((e && e.message) || e)) ? 'denied' : String((e && e.message) || e).slice(0, 80); }
+      };
+      out.sale = await tryCommit([
+        set('transactions', 's-1', { id: 's-1', uid: 'st-1', businessId: BIZ, txType: 'Sale', invoiceId: 'INV-0002', totalAmount: 5, isDeleted: false }),
+        set('journalEntries', 'j-1', { id: 'j-1', businessId: BIZ, transactionId: 's-1' }),
+        set('ledgers', 'l-1', { id: 'l-1', businessId: BIZ, transactionId: 's-1' }),
+        set('accounts', 'acc-1', { balance: 5 }, { merge: true }),
+      ]);
+      out.purchase = await tryCommit([set('transactions', 'b-1', { id: 'b-1', uid: 'st-1', businessId: BIZ, txType: 'Purchase', totalAmount: 1, isDeleted: false })]);
+      out.loneLedger = await tryCommit([set('ledgers', 'l-2', { id: 'l-2', businessId: BIZ, transactionId: 's-1' })]);
+      out.seen = (await m.local.query({ table: 'transactions' })).map((row) => row.id).sort();
+      out.numbers = (await m.local.query({ table: 'transactions', fields: ['invoiceId'] })).map((row) => row.data.invoiceId).sort();
+      const backup = await m.backup.run().catch((e) => ({ error: String((e && e.message) || e) }));
+      out.backup = backup && backup.ok === false ? backup.error : 'allowed';
+      out.licence = await m.licence.activate('MDL-AAAAAA-BBBBBB-CCCCCC').then(() => 'allowed', (e) => (/owner/i.test(String((e && e.message) || e)) ? 'owner-only' : String((e && e.message) || e).slice(0, 60)));
+      await m.local.auth({ op: 'signOut' });
+      await m.local.auth({ op: 'signIn', email: 'smoke@example.com', password: 'smoke-password-2' });
+      return out;
+    });
+    check('a staff sign-in takes its role from the staff and role records, and signs in with that name', staffRun.made === 'Cashier' && staffRun.role === 'Cashier', JSON.stringify(staffRun));
+    check('a staff sign-in reads no payroll and can read the products', staffRun.payrolls === 0 && staffRun.products === 1, JSON.stringify(staffRun));
+    check('the Cashier saves a sale with its journal and ledger lines, and is refused a purchase and a lone ledger line', staffRun.sale === 'ok' && staffRun.purchase === 'denied' && staffRun.loneLedger === 'denied', JSON.stringify(staffRun));
+    check('the Cashier sees only their own sale, while the invoice number lookup still sees everyone\'s', JSON.stringify(staffRun.seen) === JSON.stringify(['s-1']) && staffRun.numbers.includes('INV-0001') && staffRun.numbers.includes('INV-0002'), JSON.stringify(staffRun));
+    check('backups and licence codes refuse a staff sign-in', staffRun.backup === 'owner-only' && staffRun.licence === 'owner-only', JSON.stringify(staffRun));
     if (pageErrors.length) console.log(`note: ${pageErrors.length} uncaught page error(s), first: ${pageErrors[0]}`);
     firstRunOk = true;
   } catch (error) {
