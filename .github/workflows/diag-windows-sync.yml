@@ -15,6 +15,10 @@ on:
         description: 'How many times to run the tests'
         required: true
         default: '3'
+      suite:
+        description: 'sync = the sync race tests only, all = the whole unit suite (as the release build runs it)'
+        required: true
+        default: 'all'
 
 permissions:
   contents: read
@@ -46,12 +50,17 @@ jobs:
         env:
           MD_SYNC_TRACE: '1'
           RUNS: ${{ inputs.runs }}
+          SUITE: ${{ inputs.suite }}
         run: |
           mkdir -p diag
           for i in $(seq 1 "$RUNS"); do
             echo "=== run $i ==="
-            node --test --test-reporter=spec desktop/sync-engine-sale.test.js > "diag/run-$i.log" 2>&1 || echo "run $i failed"
-            grep -E "^(✔|✖)|ℹ (pass|fail)" "diag/run-$i.log" || true
+            if [ "$SUITE" = "sync" ]; then
+              node --test --test-reporter=spec desktop/sync-engine-sale.test.js > "diag/run-$i.log" 2>&1 || echo "run $i failed"
+            else
+              npm run test:desktop > "diag/run-$i.log" 2>&1 || echo "run $i failed"
+            fi
+            grep -E "^✖|ℹ (pass|fail)" "diag/run-$i.log" || true
           done
 
       - name: Keep the logs
