@@ -1,0 +1,63 @@
+name: Diagnose Desktop sync on Windows
+
+# Test only: runs the work-from-anywhere sync tests on a Windows runner with the folder carrier's trace on,
+# to find why a staff computer's last packet waits on Windows. Builds nothing, publishes nothing.
+# Started by hand only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or tag in the private source repo'
+        required: true
+        default: 'diag/windows-sync'
+      runs:
+        description: 'How many times to run the tests'
+        required: true
+        default: '3'
+
+permissions:
+  contents: read
+
+jobs:
+  sync-tests:
+    name: Sync tests on Windows
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the source (private repo, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: teminali/m-digital-desktop
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Run the sync tests with the trace on
+        shell: bash
+        env:
+          MD_SYNC_TRACE: '1'
+          RUNS: ${{ inputs.runs }}
+        run: |
+          mkdir -p diag
+          for i in $(seq 1 "$RUNS"); do
+            echo "=== run $i ==="
+            node --test --test-reporter=spec desktop/sync-engine-sale.test.js > "diag/run-$i.log" 2>&1 || echo "run $i failed"
+            grep -E "^(✔|✖)|ℹ (pass|fail)" "diag/run-$i.log" || true
+          done
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-sync-diag
+          path: diag/
+          retention-days: 3
